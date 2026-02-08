@@ -96,7 +96,7 @@ class BTRFSSnapshotEngine:
                 timestamp=timestamp,
             )
 
-    def create_snapshot(self, config: SectionProxy) -> None:
+    def create_snapshot(self, config: SectionProxy) -> Snapshot:
         """Create a new read-only BTRFS snapshot for a configured volume."""
         now = datetime.now()
         now_str = now.strftime(TIMESTAMP_FORMAT)
@@ -104,11 +104,17 @@ class BTRFSSnapshotEngine:
             config["location"].removeprefix(
                 "/").replace("/", "_") + "_" + now_str
         )
+        snapshot_location = f"{config['snapshot_destination']}/{snapshot_name}"
         command = f"btrfs subvolume snapshot -r {config['location']} {
-            config['snapshot_destination']
-        }/{snapshot_name}".split()
-        output = sp.check_output(command)
-        print(output)
+            snapshot_location
+        }".split()
+        sp.check_output(command)
+        return Snapshot(
+            type="btrfs",
+            target=config["location"],
+            location=snapshot_location,
+            timestamp=now,
+        )
 
 
 class ZFSSnapshotEngine:
@@ -137,13 +143,30 @@ class ZFSSnapshotEngine:
                 timestamp=timestamp,
             )
 
-    def create_snapshot(self, config: SectionProxy) -> None:
+    def create_snapshot(self, config: SectionProxy) -> Snapshot:
         """Create a new ZFS snapshot for a configured volume."""
         now = datetime.now()
         now_str = now.strftime(TIMESTAMP_FORMAT)
-        command = f"zfs snapshot {config['location']}@{now_str}".split()
-        output = sp.check_output(command)
-        print(output)
+        snapshot_location = f"{config['location']}@{now_str}"
+        command = f"zfs snapshot {snapshot_location}".split()
+        sp.check_output(command)
+        return Snapshot(
+            type="zfs",
+            target=config["location"],
+            location=snapshot_location,
+            timestamp=now,
+        )
+
+
+def format_snapshot(snapshot: Snapshot) -> str:
+    return "\t".join(
+        [
+            snapshot.target,
+            snapshot.timestamp.isoformat(),
+            snapshot.type,
+            snapshot.location,
+        ]
+    )
 
 
 if __name__ == "__main__":
@@ -161,17 +184,9 @@ if __name__ == "__main__":
             engine = engines[vol_cfg["type"]]
             if arg == "list":
                 for snapshot in engine.list_snapshots(vol_cfg):
-                    print(
-                        "\t".join(
-                            [
-                                snapshot.target,
-                                snapshot.timestamp.isoformat(),
-                                snapshot.type,
-                                snapshot.location,
-                            ]
-                        )
-                    )
+                    print(format_snapshot(snapshot))
             elif arg == "snapshot":
-                engine.create_snapshot(vol_cfg)
+                snapshot = engine.create_snapshot(vol_cfg)
+                print(format_snapshot(snapshot))
             else:
                 print(f"Unsupported command: {arg}")
