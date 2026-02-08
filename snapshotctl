@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+import configparser
+from configparser import SectionProxy
+from dataclasses import dataclass
+from datetime import datetime
+import json
+from urllib.parse import urlparse, unquote, parse_qs
+import subprocess as sp
+import re
+from sys import argv
+
+
+@dataclass
+class Snapshot:
+    type: str
+    target: str
+    location: str
+    timestamp: datetime
+
+
+class BTRFSSnapshotEngine:
+    def _parse_subvol_line(self, line: str):
+        keywords = ["ID", "gen", "cgen", "top level", "otime", "path"]
+        result = {}
+        key_acc = ""
+        val_acc = ""
+        tokens = line.split()
+        for token in tokens:
+            if any(token in kw for kw in keywords):
+                if val_acc:
+                    result[key_acc.strip()] = val_acc.strip()
+                    val_acc = ""
+                    key_acc = ""
+                key_acc += f"{token} "
+            else:
+                val_acc += f"{token} "
+        result[key_acc.strip()] = val_acc.strip()
+        return result
+
+    def list_snapshots(self, config: SectionProxy) -> str:
+        snapshot_prefix = config["location"].removeprefix(
+            "/").replace("/", "_")
+        command = f"btrfs subvolume list -s {
+            config['snapshot_destination']}".split()
+        output = sp.check_output(command).decode().strip()
+        for row in output.split("\n"):
+            snapshot = self._parse_subvol_line(row)
+
+            # if not snapshot["path"].startswith(snapshot_prefix):
+            #     continue
+
+            snapshot_name, timestamp = snapshot["path"].rsplit("_", maxsplit=1)
+            if snapshot_name != snapshot_prefix:
+                continue
+            timestamp = datetime.strptime(timestamp, "%Y%m%dT%H%M%S")
+
+            yield Snapshot(
+                type="btrfs",
+                target=config["location"],
+                location=config["snapshot_destination"] +
+                "/" + snapshot["path"],
+                timestamp=timestamp,
+            )
+
+    def create_snapshot(self, config_url: str) -> str:
+        parsed = urlparse(config_url)
+        query = parse_qs(parsed.query)
+        snapshot_destination = query["destination"][0]
+        now = datetime.now()
+        now_str = now.strftime("%Y%m%dT%H%M%S")
+        snapshot_name = parsed.path.removeprefix(
+            "/").replace("/", "_") + "_" + now_str
+        command = f"btrfs subvolume snapshot -r {parsed.path} {snapshot_destination}/{
+            snapshot_name
+        }".split()
+        output = sp.check_output(command)
+        print(output)
+
+
+class ZFSSnapshotEngine:
+    def list_snapshots(self, config: SectionProxy) -> str:
+        command = f"zfs list -j -t snapshot {config['location']}".split()
+        output = sp.check_output(command)
+        data = json.loads(output)
+        for obj in data["datasets"].values():
+            timestamp = datetime.strptime(
+                obj["snapshot_name"], "%Y%m%dT%H%M%S")
+            yield Snapshot(
+                type="zfs",
+                target=obj["dataset"],
+                location=obj["name"],
+                timestamp=timestamp,
+            )
+
+    def create_snapshot(self, config_url: str) -> str:
+        parsed = urlparse(config_url)
+        query = parse_qs(parsed.query)
+        now = datetime.now()
+        now_str = now.strftime("%Y%m%dT%H%M%S")
+        command = f"zfs snapshot {parsed.netloc}{
+            parsed.path}@{now_str}".split()
+        output = sp.check_output(command)
+        print(output)
+
+
+if __name__ == "__main__":
+    config = configparser.ConfigParser()
+    config.read("/etc/snapshots.conf")
+    engines = {
+        "btrfs": BTRFSSnapshotEngine(),
+        "zfs": ZFSSnapshotEngine(),
+    }
+    arg = argv[1]
+
+    for section in config.sections():
+        if section.startswith("volume."):
+            vol_cfg = config[section]
+            engine = engines[vol_cfg["type"]]
+            if arg == "list":
+                for snapshot in engine.list_snapshots(vol_cfg):
+                    print(snapshot)
+            elif arg == "snapshot":
+                engine.create_snapshot(curl)
+            else:
+                print(f"Unsupported command: {arg}")
