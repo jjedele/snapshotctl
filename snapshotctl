@@ -75,8 +75,10 @@ class BTRFSSnapshotEngine:
         Runs ``btrfs subvolume list -s`` against the snapshot destination
         and yields snapshots whose names match the configured location.
         """
-        snapshot_prefix = config["location"].removeprefix("/").replace("/", "_")
-        command = f"btrfs subvolume list -s {config['snapshot_destination']}".split()
+        snapshot_prefix = config["location"].removeprefix(
+            "/").replace("/", "_")
+        command = f"btrfs subvolume list -s {
+            config['snapshot_destination']}".split()
         output = sp.check_output(command).decode().strip()
         for row in output.split("\n"):
             snapshot = self._parse_subvol_line(row)
@@ -89,7 +91,8 @@ class BTRFSSnapshotEngine:
             yield Snapshot(
                 type="btrfs",
                 target=config["location"],
-                location=config["snapshot_destination"] + "/" + snapshot["path"],
+                location=config["snapshot_destination"] +
+                "/" + snapshot["path"],
                 timestamp=timestamp,
             )
 
@@ -98,7 +101,8 @@ class BTRFSSnapshotEngine:
         now = datetime.now()
         now_str = now.strftime(TIMESTAMP_FORMAT)
         snapshot_name = (
-            config["location"].removeprefix("/").replace("/", "_") + "_" + now_str
+            config["location"].removeprefix(
+                "/").replace("/", "_") + "_" + now_str
         )
         command = f"btrfs subvolume snapshot -r {config['location']} {
             config['snapshot_destination']
@@ -124,7 +128,8 @@ class ZFSSnapshotEngine:
         output = sp.check_output(command)
         data = json.loads(output)
         for obj in data["datasets"].values():
-            timestamp = datetime.strptime(obj["snapshot_name"], TIMESTAMP_FORMAT)
+            timestamp = datetime.strptime(
+                obj["snapshot_name"], TIMESTAMP_FORMAT)
             yield Snapshot(
                 type="zfs",
                 target=obj["dataset"],
@@ -156,7 +161,16 @@ if __name__ == "__main__":
             engine = engines[vol_cfg["type"]]
             if arg == "list":
                 for snapshot in engine.list_snapshots(vol_cfg):
-                    print(snapshot)
+                    print(
+                        "\t".join(
+                            [
+                                snapshot.target,
+                                snapshot.timestamp.isoformat(),
+                                snapshot.type,
+                                snapshot.location,
+                            ]
+                        )
+                    )
             elif arg == "snapshot":
                 engine.create_snapshot(vol_cfg)
             else:
