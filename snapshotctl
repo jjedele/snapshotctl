@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
+"""CLI tool for managing BTRFS and ZFS filesystem snapshots.
+
+Reads volume configuration from /etc/snapshots.conf and provides
+a unified interface to create and list snapshots across filesystem types.
+
+Usage:
+    snapshotctl snapshot    Create snapshots for all configured volumes.
+    snapshotctl list        List existing snapshots for all configured volumes.
+"""
+
 import configparser
+from collections.abc import Iterator
 from configparser import SectionProxy
 from dataclasses import dataclass
 from datetime import datetime
@@ -7,9 +18,20 @@ import json
 import subprocess as sp
 from sys import argv
 
+TIMESTAMP_FORMAT = "%Y%m%dT%H%M%S"
+
 
 @dataclass
 class Snapshot:
+    """A filesystem snapshot.
+
+    Attributes:
+        type: Filesystem type ("btrfs" or "zfs").
+        target: The source subvolume or dataset that was snapshotted.
+        location: Full path to the snapshot on disk.
+        timestamp: When the snapshot was created.
+    """
+
     type: str
     target: str
     location: str
@@ -17,7 +39,19 @@ class Snapshot:
 
 
 class BTRFSSnapshotEngine:
-    def _parse_subvol_line(self, line: str):
+    """Snapshot engine for BTRFS filesystems.
+
+    Creates read-only snapshots and lists existing ones by shelling out
+    to the ``btrfs`` CLI. Snapshot names follow the pattern
+    ``<sanitized_location>_<YYYYMMDDTHHMMSS>``.
+    """
+
+    def _parse_subvol_line(self, line: str) -> dict[str, str]:
+        """Parse a single line of ``btrfs subvolume list`` output.
+
+        Splits the line into key-value pairs based on known keywords
+        (ID, gen, cgen, top level, otime, path).
+        """
         keywords = ["ID", "gen", "cgen", "top level", "otime", "path"]
         result = {}
         key_acc = ""
@@ -35,20 +69,22 @@ class BTRFSSnapshotEngine:
         result[key_acc.strip()] = val_acc.strip()
         return result
 
-    def list_snapshots(self, config: SectionProxy) -> str:
+    def list_snapshots(self, config: SectionProxy) -> Iterator[Snapshot]:
+        """List existing BTRFS snapshots for a configured volume.
+
+        Runs ``btrfs subvolume list -s`` against the snapshot destination
+        and yields snapshots whose names match the configured location.
+        """
         snapshot_prefix = config["location"].removeprefix("/").replace("/", "_")
         command = f"btrfs subvolume list -s {config['snapshot_destination']}".split()
         output = sp.check_output(command).decode().strip()
         for row in output.split("\n"):
             snapshot = self._parse_subvol_line(row)
 
-            # if not snapshot["path"].startswith(snapshot_prefix):
-            #     continue
-
             snapshot_name, timestamp = snapshot["path"].rsplit("_", maxsplit=1)
             if snapshot_name != snapshot_prefix:
                 continue
-            timestamp = datetime.strptime(timestamp, "%Y%m%dT%H%M%S")
+            timestamp = datetime.strptime(timestamp, TIMESTAMP_FORMAT)
 
             yield Snapshot(
                 type="btrfs",
@@ -57,9 +93,10 @@ class BTRFSSnapshotEngine:
                 timestamp=timestamp,
             )
 
-    def create_snapshot(self, config: SectionProxy) -> str:
+    def create_snapshot(self, config: SectionProxy) -> None:
+        """Create a new read-only BTRFS snapshot for a configured volume."""
         now = datetime.now()
-        now_str = now.strftime("%Y%m%dT%H%M%S")
+        now_str = now.strftime(TIMESTAMP_FORMAT)
         snapshot_name = (
             config["location"].removeprefix("/").replace("/", "_") + "_" + now_str
         )
@@ -71,12 +108,23 @@ class BTRFSSnapshotEngine:
 
 
 class ZFSSnapshotEngine:
-    def list_snapshots(self, config: SectionProxy) -> str:
+    """Snapshot engine for ZFS filesystems.
+
+    Creates snapshots and lists existing ones by shelling out to the
+    ``zfs`` CLI. Snapshot names follow the pattern
+    ``<dataset>@<YYYYMMDDTHHMMSS>``.
+    """
+
+    def list_snapshots(self, config: SectionProxy) -> Iterator[Snapshot]:
+        """List existing ZFS snapshots for a configured volume.
+
+        Runs ``zfs list -j -t snapshot`` and parses the JSON output.
+        """
         command = f"zfs list -j -t snapshot {config['location']}".split()
         output = sp.check_output(command)
         data = json.loads(output)
         for obj in data["datasets"].values():
-            timestamp = datetime.strptime(obj["snapshot_name"], "%Y%m%dT%H%M%S")
+            timestamp = datetime.strptime(obj["snapshot_name"], TIMESTAMP_FORMAT)
             yield Snapshot(
                 type="zfs",
                 target=obj["dataset"],
@@ -84,9 +132,10 @@ class ZFSSnapshotEngine:
                 timestamp=timestamp,
             )
 
-    def create_snapshot(self, config: SectionProxy) -> str:
+    def create_snapshot(self, config: SectionProxy) -> None:
+        """Create a new ZFS snapshot for a configured volume."""
         now = datetime.now()
-        now_str = now.strftime("%Y%m%dT%H%M%S")
+        now_str = now.strftime(TIMESTAMP_FORMAT)
         command = f"zfs snapshot {config['location']}@{now_str}".split()
         output = sp.check_output(command)
         print(output)
