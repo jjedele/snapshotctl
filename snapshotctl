@@ -9,13 +9,16 @@ Usage:
     snapshotctl list        List existing snapshots for all configured volumes.
 """
 
+import calendar
 import configparser
+import re
 from collections.abc import Iterator
 from configparser import SectionProxy
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import subprocess as sp
+from argparse import ArgumentParser
 from sys import argv
 
 TIMESTAMP_FORMAT = "%Y%m%dT%H%M%S"
@@ -96,9 +99,13 @@ class BTRFSSnapshotEngine:
                 timestamp=timestamp,
             )
 
-    def create_snapshot(self, config: SectionProxy) -> Snapshot:
+    def delete_snapshot(self, snapshot: Snapshot) -> None:
+        """Delete a BTRFS snapshot."""
+        command = f"btrfs subvolume delete {snapshot.location}".split()
+        sp.check_output(command)
+
+    def create_snapshot(self, config: SectionProxy, now: datetime) -> Snapshot:
         """Create a new read-only BTRFS snapshot for a configured volume."""
-        now = datetime.now()
         now_str = now.strftime(TIMESTAMP_FORMAT)
         snapshot_name = (
             config["location"].removeprefix(
@@ -143,9 +150,13 @@ class ZFSSnapshotEngine:
                 timestamp=timestamp,
             )
 
-    def create_snapshot(self, config: SectionProxy) -> Snapshot:
+    def delete_snapshot(self, snapshot: Snapshot) -> None:
+        """Delete a ZFS snapshot."""
+        command = f"zfs destroy {snapshot.location}".split()
+        sp.check_output(command)
+
+    def create_snapshot(self, config: SectionProxy, now: datetime) -> Snapshot:
         """Create a new ZFS snapshot for a configured volume."""
-        now = datetime.now()
         now_str = now.strftime(TIMESTAMP_FORMAT)
         snapshot_location = f"{config['location']}@{now_str}"
         command = f"zfs snapshot {snapshot_location}".split()
@@ -156,6 +167,83 @@ class ZFSSnapshotEngine:
             location=snapshot_location,
             timestamp=now,
         )
+
+
+def parse_retention(retention_str: str) -> list[tuple[int, str]]:
+    """Parse a retention string like '24h 7d 4w 12m' into (count, unit) pairs."""
+    result = []
+    for token in retention_str.strip().split():
+        match = re.fullmatch(r"(\d+)([hdwm])", token)
+        if not match:
+            raise ValueError(f"Invalid retention token: {token!r}")
+        count = int(match.group(1))
+        unit = match.group(2)
+        result.append((count, unit))
+    return result
+
+
+def period_start(now: datetime, unit: str) -> datetime:
+    """Return the start of the current calendar period for the given unit."""
+    if unit == "h":
+        return now.replace(minute=0, second=0, microsecond=0)
+    elif unit == "d":
+        return now.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif unit == "w":
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return day_start - timedelta(days=day_start.weekday())
+    elif unit == "m":
+        return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    else:
+        raise ValueError(f"Unknown retention unit: {unit!r}")
+
+
+def offset_periods(dt: datetime, unit: str, n: int) -> datetime:
+    """Add n calendar periods to dt (negative n to subtract)."""
+    if unit == "h":
+        return dt + timedelta(hours=n)
+    elif unit == "d":
+        return dt + timedelta(days=n)
+    elif unit == "w":
+        return dt + timedelta(weeks=n)
+    elif unit == "m":
+        month = dt.month + n
+        year = dt.year
+        while month > 12:
+            month -= 12
+            year += 1
+        while month <= 0:
+            month += 12
+            year -= 1
+        max_day = calendar.monthrange(year, month)[1]
+        return dt.replace(year=year, month=month, day=min(dt.day, max_day))
+    else:
+        raise ValueError(f"Unknown retention unit: {unit!r}")
+
+
+def compute_snapshots_to_keep(
+    snapshots: list[Snapshot],
+    retention: list[tuple[int, str]],
+    now: datetime,
+) -> set[str]:
+    """Determine which snapshot locations to keep based on the retention policy.
+
+    For each (count, unit) pair, creates ``count`` calendar-aligned time
+    buckets and keeps the most recent snapshot in each bucket.
+    """
+    keep: set[str] = set()
+    for count, unit in retention:
+        anchor = period_start(now, unit)
+        for i in range(count):
+            bucket_start = offset_periods(anchor, unit, -i)
+            bucket_end = offset_periods(anchor, unit, 1 - i)
+            best = None
+            for s in snapshots:
+                if bucket_start <= s.timestamp < bucket_end:
+                    if best is None or s.timestamp > best.timestamp:
+                        best = s
+            if best is not None:
+                keep.add(best.location)
+    return keep
 
 
 def format_snapshot(snapshot: Snapshot) -> str:
@@ -170,23 +258,57 @@ def format_snapshot(snapshot: Snapshot) -> str:
 
 
 if __name__ == "__main__":
+    parser = ArgumentParser(description="Manage BTRFS and ZFS filesystem snapshots.")
+    parser.add_argument("command", choices=["list", "snapshot", "sync"])
+    parser.add_argument("--dry-run", action="store_true", help="Show what sync would do without making changes.")
+    args = parser.parse_args()
+
     config = configparser.ConfigParser()
     config.read("/etc/snapshots.conf")
     engines = {
         "btrfs": BTRFSSnapshotEngine(),
         "zfs": ZFSSnapshotEngine(),
     }
-    arg = argv[1]
 
     for section in config.sections():
         if section.startswith("volume."):
             vol_cfg = config[section]
             engine = engines[vol_cfg["type"]]
-            if arg == "list":
+            if args.command == "list":
                 for snapshot in engine.list_snapshots(vol_cfg):
                     print(format_snapshot(snapshot))
-            elif arg == "snapshot":
-                snapshot = engine.create_snapshot(vol_cfg)
+            elif args.command == "snapshot":
+                snapshot = engine.create_snapshot(vol_cfg, datetime.now())
                 print(format_snapshot(snapshot))
-            else:
-                print(f"Unsupported command: {arg}")
+            elif args.command == "sync":
+                if "retention" not in vol_cfg:
+                    print(f"Skipping {section}: no retention policy")
+                    continue
+                now = datetime.now()
+                retention = parse_retention(vol_cfg["retention"])
+                all_snapshots = list(engine.list_snapshots(vol_cfg))
+                if args.dry_run:
+                    simulated = Snapshot(
+                        type=vol_cfg["type"],
+                        target=vol_cfg["location"],
+                        location="(new snapshot)",
+                        timestamp=now,
+                    )
+                    all_snapshots.append(simulated)
+                    keep = compute_snapshots_to_keep(all_snapshots, retention, now)
+                    all_snapshots.sort(key=lambda s: s.timestamp)
+                    for s in all_snapshots:
+                        action = "KEEP" if s.location in keep else "DELETE"
+                        print(f"{action}\t{format_snapshot(s)}")
+                else:
+                    new_snapshot = engine.create_snapshot(vol_cfg, now)
+                    print(f"Created\t{format_snapshot(new_snapshot)}")
+                    all_snapshots.append(new_snapshot)
+                    keep = compute_snapshots_to_keep(all_snapshots, retention, now)
+                    for s in all_snapshots:
+                        if s.location not in keep:
+                            try:
+                                engine.delete_snapshot(s)
+                                print(f"Deleted\t{format_snapshot(s)}")
+                            except sp.CalledProcessError as e:
+                                print(f"Error deleting\t{format_snapshot(s)}: {e}")
