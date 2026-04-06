@@ -19,12 +19,12 @@ from datetime import datetime, timedelta
 import json
 import subprocess as sp
 from argparse import ArgumentParser
-from sys import argv
+from typing import Literal
 
 TIMESTAMP_FORMAT = "%Y%m%dT%H%M%S"
 
 
-@dataclass
+@dataclass(frozen=True)
 class Snapshot:
     """A filesystem snapshot.
 
@@ -78,10 +78,8 @@ class BTRFSSnapshotEngine:
         Runs ``btrfs subvolume list -s`` against the snapshot destination
         and yields snapshots whose names match the configured location.
         """
-        snapshot_prefix = config["location"].removeprefix(
-            "/").replace("/", "_")
-        command = f"btrfs subvolume list -s {
-            config['snapshot_destination']}".split()
+        snapshot_prefix = config["location"].removeprefix("/").replace("/", "_")
+        command = f"btrfs subvolume list -s {config['snapshot_destination']}".split()
         output = sp.check_output(command).decode().strip()
         for row in output.split("\n"):
             snapshot = self._parse_subvol_line(row)
@@ -94,8 +92,7 @@ class BTRFSSnapshotEngine:
             yield Snapshot(
                 type="btrfs",
                 target=config["location"],
-                location=config["snapshot_destination"] +
-                "/" + snapshot["path"],
+                location=config["snapshot_destination"] + "/" + snapshot["path"],
                 timestamp=timestamp,
             )
 
@@ -108,8 +105,7 @@ class BTRFSSnapshotEngine:
         """Create a new read-only BTRFS snapshot for a configured volume."""
         now_str = now.strftime(TIMESTAMP_FORMAT)
         snapshot_name = (
-            config["location"].removeprefix(
-                "/").replace("/", "_") + "_" + now_str
+            config["location"].removeprefix("/").replace("/", "_") + "_" + now_str
         )
         snapshot_location = f"{config['snapshot_destination']}/{snapshot_name}"
         command = f"btrfs subvolume snapshot -r {config['location']} {
@@ -141,8 +137,7 @@ class ZFSSnapshotEngine:
         output = sp.check_output(command)
         data = json.loads(output)
         for obj in data["datasets"].values():
-            timestamp = datetime.strptime(
-                obj["snapshot_name"], TIMESTAMP_FORMAT)
+            timestamp = datetime.strptime(obj["snapshot_name"], TIMESTAMP_FORMAT)
             yield Snapshot(
                 type="zfs",
                 target=obj["dataset"],
@@ -220,47 +215,131 @@ def offset_periods(dt: datetime, unit: str, n: int) -> datetime:
         raise ValueError(f"Unknown retention unit: {unit!r}")
 
 
+def get_n_time_windows_upto_reference(
+    reference: datetime, n: int, interval: Literal["h", "d", "w", "m"]
+) -> list[tuple[datetime, datetime]]:
+    """
+    Get n consecutive time slices of length of the given interval such
+    that the reference is included in the last one.
+
+    The time slices are always aligned with the calendar.
+
+    Examples:
+        1. reference=2026-04-04T01:36, n=3, interval="h"
+            -> [(2026-04-03T23:00, 2026-04-04T00:00),
+                (2026-04-04T00:00, 2026-04-04T01:00),
+                (2026-04-04T01:00, 2026-04-04T02:00)]
+        2. reference=2026-04-04T01:36, n=2, interval="d"
+            -> [(2026-04-03T00:00, 2026-04-04T00:00),
+                (2026-04-04T00:00, 2026-04-05T00:00)]
+        3. reference=2026-04-04T01:36, n=2, interval="w"
+            -> [(2026-03-23T00:00, 2026-03-30T00:00),
+                (2026-03-30T00:00, 2026-04-06T00:00)]
+    """
+    anchor = period_start(reference, interval)
+    windows = []
+    for i in range(n):
+        start = offset_periods(anchor, interval, -(n - 1 - i))
+        end = offset_periods(start, interval, 1)
+        windows.append((start, end))
+    return windows
+
+
 def compute_snapshots_to_keep(
     snapshots: list[Snapshot],
     retention: list[tuple[int, str]],
     now: datetime,
-) -> set[str]:
-    """Determine which snapshot locations to keep based on the retention policy.
+) -> set[Snapshot]:
+    """Determine which snapshots to keep based on the retention policy.
 
     For each (count, unit) pair, creates ``count`` calendar-aligned time
     buckets and keeps the most recent snapshot in each bucket.
     """
-    keep: set[str] = set()
+    keep: set[Snapshot] = set()
     for count, unit in retention:
-        anchor = period_start(now, unit)
-        for i in range(count):
-            bucket_start = offset_periods(anchor, unit, -i)
-            bucket_end = offset_periods(anchor, unit, 1 - i)
+        for bucket_start, bucket_end in get_n_time_windows_upto_reference(
+            now, count, unit
+        ):
             best = None
             for s in snapshots:
                 if bucket_start <= s.timestamp < bucket_end:
                     if best is None or s.timestamp > best.timestamp:
                         best = s
             if best is not None:
-                keep.add(best.location)
+                keep.add(best)
     return keep
 
 
 def format_snapshot(snapshot: Snapshot) -> str:
+    """Format a snapshot as a tab-separated string of target, timestamp, type, and location."""
     return "\t".join(
         [
             snapshot.target,
-            snapshot.timestamp.isoformat(),
+            snapshot.timestamp.isoformat(timespec="seconds"),
             snapshot.type,
             snapshot.location,
         ]
     )
 
 
+def cmd_list(engine, vol_cfg: SectionProxy) -> None:
+    """Print all existing snapshots for a configured volume."""
+    for snapshot in engine.list_snapshots(vol_cfg):
+        print(format_snapshot(snapshot))
+
+
+def cmd_snapshot(engine, vol_cfg: SectionProxy) -> None:
+    """Create a new snapshot for a configured volume and print it."""
+    snapshot = engine.create_snapshot(vol_cfg, datetime.now())
+    print(format_snapshot(snapshot))
+
+
+def cmd_sync(engine, vol_cfg: SectionProxy, section: str, dry_run: bool) -> None:
+    """Create a snapshot and delete expired ones according to the retention policy.
+
+    In dry-run mode, simulates the operation and prints what would be kept or deleted.
+    """
+    if "retention" not in vol_cfg:
+        print(f"Skipping {section}: no retention policy")
+        return
+    now = datetime.now()
+    retention = parse_retention(vol_cfg["retention"])
+    all_snapshots = list(engine.list_snapshots(vol_cfg))
+    if dry_run:
+        simulated = Snapshot(
+            type=vol_cfg["type"],
+            target=vol_cfg["location"],
+            location="(new snapshot)",
+            timestamp=now,
+        )
+        all_snapshots.append(simulated)
+        keep = compute_snapshots_to_keep(all_snapshots, retention, now)
+        all_snapshots.sort(key=lambda s: s.timestamp)
+        for s in all_snapshots:
+            action = "KEEP" if s in keep else "DELETE"
+            print(f"{action}\t{format_snapshot(s)}")
+    else:
+        new_snapshot = engine.create_snapshot(vol_cfg, now)
+        print(f"Created\t{format_snapshot(new_snapshot)}")
+        all_snapshots.append(new_snapshot)
+        keep = compute_snapshots_to_keep(all_snapshots, retention, now)
+        for s in all_snapshots:
+            if s not in keep:
+                try:
+                    engine.delete_snapshot(s)
+                    print(f"Deleted\t{format_snapshot(s)}")
+                except sp.CalledProcessError as e:
+                    print(f"Error deleting\t{format_snapshot(s)}: {e}")
+
+
 if __name__ == "__main__":
     parser = ArgumentParser(description="Manage BTRFS and ZFS filesystem snapshots.")
     parser.add_argument("command", choices=["list", "snapshot", "sync"])
-    parser.add_argument("--dry-run", action="store_true", help="Show what sync would do without making changes.")
+    parser.add_argument(
+        "--dry",
+        action="store_true",
+        help="Show what sync would do without making changes.",
+    )
     args = parser.parse_args()
 
     config = configparser.ConfigParser()
@@ -275,40 +354,8 @@ if __name__ == "__main__":
             vol_cfg = config[section]
             engine = engines[vol_cfg["type"]]
             if args.command == "list":
-                for snapshot in engine.list_snapshots(vol_cfg):
-                    print(format_snapshot(snapshot))
+                cmd_list(engine, vol_cfg)
             elif args.command == "snapshot":
-                snapshot = engine.create_snapshot(vol_cfg, datetime.now())
-                print(format_snapshot(snapshot))
+                cmd_snapshot(engine, vol_cfg)
             elif args.command == "sync":
-                if "retention" not in vol_cfg:
-                    print(f"Skipping {section}: no retention policy")
-                    continue
-                now = datetime.now()
-                retention = parse_retention(vol_cfg["retention"])
-                all_snapshots = list(engine.list_snapshots(vol_cfg))
-                if args.dry_run:
-                    simulated = Snapshot(
-                        type=vol_cfg["type"],
-                        target=vol_cfg["location"],
-                        location="(new snapshot)",
-                        timestamp=now,
-                    )
-                    all_snapshots.append(simulated)
-                    keep = compute_snapshots_to_keep(all_snapshots, retention, now)
-                    all_snapshots.sort(key=lambda s: s.timestamp)
-                    for s in all_snapshots:
-                        action = "KEEP" if s.location in keep else "DELETE"
-                        print(f"{action}\t{format_snapshot(s)}")
-                else:
-                    new_snapshot = engine.create_snapshot(vol_cfg, now)
-                    print(f"Created\t{format_snapshot(new_snapshot)}")
-                    all_snapshots.append(new_snapshot)
-                    keep = compute_snapshots_to_keep(all_snapshots, retention, now)
-                    for s in all_snapshots:
-                        if s.location not in keep:
-                            try:
-                                engine.delete_snapshot(s)
-                                print(f"Deleted\t{format_snapshot(s)}")
-                            except sp.CalledProcessError as e:
-                                print(f"Error deleting\t{format_snapshot(s)}: {e}")
+                cmd_sync(engine, vol_cfg, section, args.dry)
